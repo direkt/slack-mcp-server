@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -67,9 +68,15 @@ type conversationParams struct {
 }
 
 type searchParams struct {
-	query string
-	limit int
-	page  int
+	query             string
+	limit             int
+	page              int
+	channels          []string // Multiple channels
+	minThreadReplies  int      // Minimum thread replies
+	dayOfWeek         string   // Specific day of week (monday, tuesday, etc.)
+	hourRangeStart    int      // Start hour in UTC (0-23)
+	hourRangeEnd      int      // End hour in UTC (0-23)
+	postSearchFilters bool     // Whether post-search filtering is needed
 }
 
 type addMessageParams struct {
@@ -319,26 +326,153 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 	}
 	ch.logger.Debug("Search params parsed", zap.String("query", params.query), zap.Int("limit", params.limit), zap.Int("page", params.page))
 
-	searchParams := slack.SearchParameters{
-		Sort:          slack.DEFAULT_SEARCH_SORT,
-		SortDirection: slack.DEFAULT_SEARCH_SORT_DIR,
-		Highlight:     false,
-		Count:         params.limit,
-		Page:          params.page,
-	}
-	messagesRes, _, err := ch.apiProvider.Slack().SearchContext(ctx, params.query, searchParams)
-	if err != nil {
-		ch.logger.Error("Slack SearchContext failed", zap.Error(err))
-		return nil, err
-	}
-	ch.logger.Debug("Search completed", zap.Int("matches", len(messagesRes.Matches)))
+	var allMessages []slack.SearchMessage
 
-	messages := ch.convertMessagesFromSearch(messagesRes.Matches)
-	if len(messages) > 0 && messagesRes.Pagination.Page < messagesRes.Pagination.PageCount {
-		nextCursor := fmt.Sprintf("page:%d", messagesRes.Pagination.Page+1)
-		messages[len(messages)-1].Cursor = base64.StdEncoding.EncodeToString([]byte(nextCursor))
+	// Handle multi-channel search
+	if len(params.channels) > 0 {
+		for _, channelName := range params.channels {
+			// Create query with specific channel filter
+			queryWithChannel := params.query
+			if strings.Contains(queryWithChannel, " in:") {
+				// Replace existing in: filter
+				queryWithChannel = strings.ReplaceAll(queryWithChannel, " in:"+strings.Split(queryWithChannel[strings.Index(queryWithChannel, " in:")+4:], " ")[0], " in:"+channelName)
+			} else {
+				// Add new in: filter
+				queryWithChannel = queryWithChannel + " in:" + channelName
+			}
+
+			searchParams := slack.SearchParameters{
+				Sort:          slack.DEFAULT_SEARCH_SORT,
+				SortDirection: slack.DEFAULT_SEARCH_SORT_DIR,
+				Highlight:     false,
+				Count:         params.limit,
+				Page:          params.page,
+			}
+
+			messagesRes, _, err := ch.apiProvider.Slack().SearchContext(ctx, queryWithChannel, searchParams)
+			if err != nil {
+				ch.logger.Error("Slack SearchContext failed for channel", zap.String("channel", channelName), zap.Error(err))
+				return nil, err
+			}
+			ch.logger.Debug("Search completed for channel", zap.String("channel", channelName), zap.Int("matches", len(messagesRes.Matches)))
+
+			allMessages = append(allMessages, messagesRes.Matches...)
+		}
+
+		// Sort merged messages by timestamp (descending - most recent first)
+		sort.Slice(allMessages, func(i, j int) bool {
+			return allMessages[i].Timestamp > allMessages[j].Timestamp
+		})
+	} else {
+		// Single search or no specific channel
+		searchParams := slack.SearchParameters{
+			Sort:          slack.DEFAULT_SEARCH_SORT,
+			SortDirection: slack.DEFAULT_SEARCH_SORT_DIR,
+			Highlight:     false,
+			Count:         params.limit,
+			Page:          params.page,
+		}
+
+		messagesRes, _, err := ch.apiProvider.Slack().SearchContext(ctx, params.query, searchParams)
+		if err != nil {
+			ch.logger.Error("Slack SearchContext failed", zap.Error(err))
+			return nil, err
+		}
+		ch.logger.Debug("Search completed", zap.Int("matches", len(messagesRes.Matches)))
+
+		allMessages = messagesRes.Matches
+	}
+
+	// Apply post-search filters (day of week, hour range, min thread replies)
+	if params.postSearchFilters {
+		allMessages, err = ch.applyPostSearchFilters(ctx, allMessages, params)
+		if err != nil {
+			ch.logger.Error("Failed to apply post-search filters", zap.Error(err))
+			return nil, err
+		}
+	}
+
+	messages := ch.convertMessagesFromSearch(allMessages)
+	if len(messages) > 0 {
+		// For multi-channel search, add cursor to last message for pagination
+		if len(params.channels) > 0 {
+			nextCursor := fmt.Sprintf("page:%d", params.page+1)
+			messages[len(messages)-1].Cursor = base64.StdEncoding.EncodeToString([]byte(nextCursor))
+		}
 	}
 	return marshalMessagesToCSV(messages)
+}
+
+// applyPostSearchFilters filters messages based on day of week, hour range, and thread reply count
+func (ch *ConversationsHandler) applyPostSearchFilters(ctx context.Context, messages []slack.SearchMessage, params *searchParams) ([]slack.SearchMessage, error) {
+	var filtered []slack.SearchMessage
+
+	for _, msg := range messages {
+		// Check day of week filter
+		if params.dayOfWeek != "" {
+			matches, err := messageMatchesDayOfWeek(msg.Timestamp, params.dayOfWeek)
+			if err != nil {
+				ch.logger.Warn("Failed to check day of week for message", zap.String("ts", msg.Timestamp), zap.Error(err))
+				continue
+			}
+			if !matches {
+				continue
+			}
+		}
+
+		// Check hour range filter
+		if params.hourRangeStart != 0 || params.hourRangeEnd != 0 {
+			matches, err := messageMatchesHourRange(msg.Timestamp, params.hourRangeStart, params.hourRangeEnd)
+			if err != nil {
+				ch.logger.Warn("Failed to check hour range for message", zap.String("ts", msg.Timestamp), zap.Error(err))
+				continue
+			}
+			if !matches {
+				continue
+			}
+		}
+
+		// Check thread reply count filter
+		if params.minThreadReplies > 0 {
+			// Get thread info
+			channelID := msg.Channel.ID
+			replyCount, err := ch.getThreadReplyCount(ctx, channelID, msg.Timestamp)
+			if err != nil {
+				ch.logger.Warn("Failed to get thread reply count", zap.String("channel", channelID), zap.String("ts", msg.Timestamp), zap.Error(err))
+				continue
+			}
+
+			if replyCount < params.minThreadReplies {
+				continue
+			}
+		}
+
+		filtered = append(filtered, msg)
+	}
+
+	return filtered, nil
+}
+
+// getThreadReplyCount fetches the reply count for a message in a thread
+func (ch *ConversationsHandler) getThreadReplyCount(ctx context.Context, channelID string, threadTs string) (int, error) {
+	// Use GetConversationRepliesContext to get thread info
+	replies, _, _, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx,
+		&slack.GetConversationRepliesParameters{
+			ChannelID: channelID,
+			Timestamp: threadTs,
+			Limit:     1, // We only need to check reply_count
+		},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get conversation replies: %v", err)
+	}
+
+	if len(replies) > 0 {
+		// The reply_count is in the message metadata
+		return len(replies) - 1, nil // -1 because first message is the parent
+	}
+
+	return 0, nil
 }
 
 func isChannelAllowed(channel string) bool {
@@ -592,6 +726,162 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(request mcp.CallToolRe
 	}, nil
 }
 
+// parseDateRangeFormat converts formats like "30d", "120d", "1y" to a date string
+func parseDateRangeFormat(s string) (string, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+
+	if s == "" {
+		return "", nil
+	}
+
+	// Check for time-based formats
+	if strings.HasSuffix(s, "d") {
+		days := strings.TrimSuffix(s, "d")
+		dayCount, err := strconv.Atoi(days)
+		if err != nil || dayCount <= 0 {
+			return "", fmt.Errorf("invalid day format: %s", s)
+		}
+		// Calculate date N days ago
+		pastDate := time.Now().UTC().AddDate(0, 0, -dayCount)
+		return pastDate.Format("2006-01-02"), nil
+	}
+
+	if strings.HasSuffix(s, "y") {
+		years := strings.TrimSuffix(s, "y")
+		yearCount, err := strconv.Atoi(years)
+		if err != nil || yearCount <= 0 {
+			return "", fmt.Errorf("invalid year format: %s", s)
+		}
+		// Calculate date N years ago
+		pastDate := time.Now().UTC().AddDate(-yearCount, 0, 0)
+		return pastDate.Format("2006-01-02"), nil
+	}
+
+	// Not a time-based format, return as-is for standard date parsing
+	return s, nil
+}
+
+// parseHourRange parses "HH:MM-HH:MM" format and returns start and end hours
+func parseHourRange(s string) (int, int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, nil
+	}
+
+	parts := strings.Split(s, "-")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid hour range format: %s, expected HH:MM-HH:MM", s)
+	}
+
+	startStr := strings.TrimSpace(parts[0])
+	endStr := strings.TrimSpace(parts[1])
+
+	startTimeParts := strings.Split(startStr, ":")
+	if len(startTimeParts) != 2 {
+		return 0, 0, fmt.Errorf("invalid start time format: %s, expected HH:MM", startStr)
+	}
+
+	endTimeParts := strings.Split(endStr, ":")
+	if len(endTimeParts) != 2 {
+		return 0, 0, fmt.Errorf("invalid end time format: %s, expected HH:MM", endStr)
+	}
+
+	startHour, err := strconv.Atoi(startTimeParts[0])
+	if err != nil || startHour < 0 || startHour > 23 {
+		return 0, 0, fmt.Errorf("invalid start hour: %s, must be 0-23", startTimeParts[0])
+	}
+
+	endHour, err := strconv.Atoi(endTimeParts[0])
+	if err != nil || endHour < 0 || endHour > 23 {
+		return 0, 0, fmt.Errorf("invalid end hour: %s, must be 0-23", endTimeParts[0])
+	}
+
+	return startHour, endHour, nil
+}
+
+// validateDayOfWeek validates day of week string
+func validateDayOfWeek(day string) (string, error) {
+	day = strings.ToLower(strings.TrimSpace(day))
+	if day == "" {
+		return "", nil
+	}
+
+	validDays := map[string]bool{
+		"monday":    true,
+		"tuesday":   true,
+		"wednesday": true,
+		"thursday":  true,
+		"friday":    true,
+		"saturday":  true,
+		"sunday":    true,
+	}
+
+	if !validDays[day] {
+		return "", fmt.Errorf("invalid day of week: %s", day)
+	}
+
+	return day, nil
+}
+
+// messageMatchesDayOfWeek checks if message timestamp matches the specified day of week
+func messageMatchesDayOfWeek(timestamp string, targetDay string) (bool, error) {
+	if targetDay == "" {
+		return true, nil
+	}
+
+	// Parse the message timestamp (should be in format like "2023-10-15T10:30:00Z" from ISO RFC3339)
+	t, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		// Try unix timestamp format (seconds.microseconds)
+		parts := strings.Split(timestamp, ".")
+		if len(parts) > 0 {
+			unixSec, err := strconv.ParseInt(parts[0], 10, 64)
+			if err != nil {
+				return false, fmt.Errorf("cannot parse message timestamp: %s", timestamp)
+			}
+			t = time.Unix(unixSec, 0).UTC()
+		} else {
+			return false, fmt.Errorf("cannot parse message timestamp: %s", timestamp)
+		}
+	}
+
+	dayName := strings.ToLower(t.Weekday().String())
+	return dayName == targetDay, nil
+}
+
+// messageMatchesHourRange checks if message timestamp falls within the specified UTC hour range
+func messageMatchesHourRange(timestamp string, startHour, endHour int) (bool, error) {
+	if startHour == 0 && endHour == 0 {
+		return true, nil
+	}
+
+	// Parse the message timestamp
+	t, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		// Try unix timestamp format
+		parts := strings.Split(timestamp, ".")
+		if len(parts) > 0 {
+			unixSec, err := strconv.ParseInt(parts[0], 10, 64)
+			if err != nil {
+				return false, fmt.Errorf("cannot parse message timestamp: %s", timestamp)
+			}
+			t = time.Unix(unixSec, 0).UTC()
+		} else {
+			return false, fmt.Errorf("cannot parse message timestamp: %s", timestamp)
+		}
+	}
+
+	hour := t.UTC().Hour()
+
+	// Handle range that doesn't wrap around midnight (e.g., 08:00-17:00)
+	if startHour <= endHour {
+		return hour >= startHour && hour < endHour, nil
+	}
+
+	// Handle range that wraps around midnight (e.g., 22:00-06:00)
+	return hour >= startHour || hour < endHour, nil
+}
+
 func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (*searchParams, error) {
 	rawQuery := strings.TrimSpace(req.GetString("search_query", ""))
 	freeText, filters := splitQuery(rawQuery)
@@ -599,7 +889,25 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 	if req.GetBool("filter_threads_only", false) {
 		addFilter(filters, "is", "thread")
 	}
-	if chName := req.GetString("filter_in_channel", ""); chName != "" {
+
+	// Handle multi-channel search
+	var channels []string
+	if chNamesStr := req.GetString("filter_in_channels", ""); chNamesStr != "" {
+		// Parse comma-separated channel names
+		chNames := strings.Split(chNamesStr, ",")
+		for _, chName := range chNames {
+			chName = strings.TrimSpace(chName)
+			if chName == "" {
+				continue
+			}
+			f, err := ch.paramFormatChannel(chName)
+			if err != nil {
+				ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
+				return nil, err
+			}
+			channels = append(channels, f)
+		}
+	} else if chName := req.GetString("filter_in_channel", ""); chName != "" {
 		f, err := ch.paramFormatChannel(chName)
 		if err != nil {
 			ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
@@ -614,6 +922,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		}
 		addFilter(filters, "in", f)
 	}
+
 	if with := req.GetString("filter_users_with", ""); with != "" {
 		f, err := ch.paramFormatUser(with)
 		if err != nil {
@@ -631,9 +940,20 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "from", f)
 	}
 
+	// Handle date range formats like "30d", "120d", "1y"
+	dateAfter := req.GetString("filter_date_after", "")
+	if dateAfter != "" {
+		convertedDate, err := parseDateRangeFormat(dateAfter)
+		if err != nil {
+			ch.logger.Error("Invalid date range format", zap.String("filter_date_after", dateAfter), zap.Error(err))
+			return nil, err
+		}
+		dateAfter = convertedDate
+	}
+
 	dateMap, err := buildDateFilters(
 		req.GetString("filter_date_before", ""),
-		req.GetString("filter_date_after", ""),
+		dateAfter,
 		req.GetString("filter_date_on", ""),
 		req.GetString("filter_date_during", ""),
 	)
@@ -644,6 +964,34 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 	for key, val := range dateMap {
 		addFilter(filters, key, val)
 	}
+
+	// Parse new filter parameters
+	minThreadReplies := req.GetInt("filter_min_thread_replies", 0)
+	if minThreadReplies < 0 {
+		ch.logger.Error("Invalid minimum thread replies", zap.Int("value", minThreadReplies))
+		return nil, fmt.Errorf("filter_min_thread_replies must be >= 0")
+	}
+
+	dayOfWeek := req.GetString("filter_day_of_week", "")
+	if dayOfWeek != "" {
+		dayOfWeek, err = validateDayOfWeek(dayOfWeek)
+		if err != nil {
+			ch.logger.Error("Invalid day of week", zap.String("filter_day_of_week", dayOfWeek), zap.Error(err))
+			return nil, err
+		}
+	}
+
+	hourRangeStart, hourRangeEnd := 0, 0
+	if hourRange := req.GetString("filter_hour_range", ""); hourRange != "" {
+		hourRangeStart, hourRangeEnd, err = parseHourRange(hourRange)
+		if err != nil {
+			ch.logger.Error("Invalid hour range", zap.String("filter_hour_range", hourRange), zap.Error(err))
+			return nil, err
+		}
+	}
+
+	// Determine if post-search filtering is needed
+	postSearchFilters := minThreadReplies > 0 || dayOfWeek != "" || hourRangeStart != 0 || hourRangeEnd != 0
 
 	finalQuery := buildQuery(freeText, filters)
 	limit := req.GetInt("limit", 100)
@@ -677,11 +1025,21 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		zap.String("query", finalQuery),
 		zap.Int("limit", limit),
 		zap.Int("page", page),
+		zap.Strings("channels", channels),
+		zap.Int("minThreadReplies", minThreadReplies),
+		zap.String("dayOfWeek", dayOfWeek),
+		zap.Ints("hourRange", []int{hourRangeStart, hourRangeEnd}),
 	)
 	return &searchParams{
-		query: finalQuery,
-		limit: limit,
-		page:  page,
+		query:             finalQuery,
+		limit:             limit,
+		page:              page,
+		channels:          channels,
+		minThreadReplies:  minThreadReplies,
+		dayOfWeek:         dayOfWeek,
+		hourRangeStart:    hourRangeStart,
+		hourRangeEnd:      hourRangeEnd,
+		postSearchFilters: postSearchFilters,
 	}, nil
 }
 

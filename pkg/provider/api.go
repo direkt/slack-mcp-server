@@ -47,7 +47,7 @@ type Channel struct {
 	IsMpIM      bool     `json:"mpim"`
 	IsIM        bool     `json:"im"`
 	IsPrivate   bool     `json:"private"`
-	User        string   `json:"user,omitempty"` // User ID for IM channels
+	User        string   `json:"user,omitempty"`    // User ID for IM channels
 	Members     []string `json:"members,omitempty"` // Member IDs for the channel
 }
 
@@ -490,7 +490,7 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 				if c.IsIM {
 					// Re-map the channel to get updated user name if available
 					remappedChannel := mapChannel(
-						c.ID, "", "", c.Topic, c.Purpose, 
+						c.ID, "", "", c.Topic, c.Purpose,
 						c.User, c.Members, c.MemberCount,
 						c.IsIM, c.IsMpIM, c.IsPrivate,
 						usersMap,
@@ -709,7 +709,7 @@ func mapChannel(
 	if isIM {
 		finalMemberCount = 2
 		userID = user // Store the user ID for later re-mapping
-		
+
 		// If user field is empty but we have members, try to extract from members
 		if userID == "" && len(members) > 0 {
 			// For IM channels, members should contain the other user's ID
@@ -721,7 +721,7 @@ func mapChannel(
 				}
 			}
 		}
-		
+
 		if u, ok := usersMap[userID]; ok {
 			channelName = "@" + u.Name
 			finalPurpose = "DM with " + u.RealName

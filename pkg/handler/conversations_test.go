@@ -590,3 +590,171 @@ func TestUnitLimitByExpression_Invalid(t *testing.T) {
 		})
 	}
 }
+
+// Tests for new filter features
+
+func TestUnitParseDateRangeFormat(t *testing.T) {
+	tests := []struct {
+		input     string
+		hasSuffix bool // true if result should be a date in YYYY-MM-DD format
+		expectErr bool
+	}{
+		{"30d", true, false},
+		{"90d", true, false},
+		{"1y", true, false},
+		{"2024-10-15", false, false}, // Not a range format, returned as-is
+		{"", false, false},           // Empty string
+		{"invalidd", false, true},    // Not a number, will fail atoi
+		{"-30d", false, true},        // Negative days
+		{"0d", false, true},          // Zero days
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result, err := parseDateRangeFormat(tt.input)
+			if tt.expectErr && err == nil {
+				t.Errorf("expected error for %q", tt.input)
+			}
+			if !tt.expectErr && err != nil {
+				t.Errorf("unexpected error for %q: %v", tt.input, err)
+			}
+			if !tt.expectErr && tt.hasSuffix {
+				// For range formats, result should be a date
+				if len(result) != 10 || result[4] != '-' || result[7] != '-' {
+					t.Errorf("expected date format (YYYY-MM-DD) for %q, got %q", tt.input, result)
+				}
+			}
+		})
+	}
+}
+
+func TestUnitParseHourRange(t *testing.T) {
+	tests := []struct {
+		input     string
+		start     int
+		end       int
+		expectErr bool
+	}{
+		{"08:00-17:00", 8, 17, false},
+		{"00:00-23:00", 0, 23, false},
+		{"22:00-06:00", 22, 6, false}, // Wraps around midnight
+		{"", 0, 0, false},             // Empty string
+		{"08:00", 0, 0, true},         // Missing end time
+		{"08:00-25:00", 0, 0, true},   // Invalid hour
+		{"24:00-01:00", 0, 0, true},   // Hour out of range
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			start, end, err := parseHourRange(tt.input)
+			if tt.expectErr && err == nil {
+				t.Errorf("expected error for %q", tt.input)
+			}
+			if !tt.expectErr && err != nil {
+				t.Errorf("unexpected error for %q: %v", tt.input, err)
+			}
+			if !tt.expectErr && tt.input != "" {
+				if start != tt.start || end != tt.end {
+					t.Errorf("expected (%d, %d) for %q, got (%d, %d)", tt.start, tt.end, tt.input, start, end)
+				}
+			}
+		})
+	}
+}
+
+func TestUnitValidateDayOfWeek(t *testing.T) {
+	tests := []struct {
+		input     string
+		expected  string
+		expectErr bool
+	}{
+		{"monday", "monday", false},
+		{"Monday", "monday", false},
+		{"MONDAY", "monday", false},
+		{"friday", "friday", false},
+		{"sunday", "sunday", false},
+		{"", "", false},
+		{"notaday", "", true},
+		{"mon", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result, err := validateDayOfWeek(tt.input)
+			if tt.expectErr && err == nil {
+				t.Errorf("expected error for %q", tt.input)
+			}
+			if !tt.expectErr && err != nil {
+				t.Errorf("unexpected error for %q: %v", tt.input, err)
+			}
+			if !tt.expectErr && result != tt.expected {
+				t.Errorf("expected %q for %q, got %q", tt.expected, tt.input, result)
+			}
+		})
+	}
+}
+
+func TestUnitMessageMatchesDayOfWeek(t *testing.T) {
+	// Test with ISO RFC3339 timestamp
+	// 2024-10-14 is a Monday
+	mondayTS := "2024-10-14T10:30:00Z"
+	wednesdayTS := "2024-10-16T10:30:00Z"
+
+	tests := []struct {
+		timestamp string
+		dayOfWeek string
+		expected  bool
+	}{
+		{mondayTS, "monday", true},
+		{mondayTS, "tuesday", false},
+		{wednesdayTS, "wednesday", true},
+		{wednesdayTS, "monday", false},
+		{mondayTS, "", true}, // Empty day of week matches all
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.timestamp+"_"+tt.dayOfWeek, func(t *testing.T) {
+			result, err := messageMatchesDayOfWeek(tt.timestamp, tt.dayOfWeek)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if result != tt.expected {
+				t.Errorf("expected %v for %s on %s, got %v", tt.expected, tt.timestamp, tt.dayOfWeek, result)
+			}
+		})
+	}
+}
+
+func TestUnitMessageMatchesHourRange(t *testing.T) {
+	// 2024-10-14T10:30:00Z is 10:30 UTC
+	ts10_30 := "2024-10-14T10:30:00Z"
+	ts22_45 := "2024-10-14T22:45:00Z"
+
+	tests := []struct {
+		timestamp   string
+		startHour   int
+		endHour     int
+		expected    bool
+		description string
+	}{
+		{ts10_30, 8, 17, true, "within business hours"},
+		{ts10_30, 18, 23, false, "after business hours"},
+		{ts22_45, 22, 6, true, "midnight wrap - evening"},
+		{ts10_30, 22, 6, false, "midnight wrap - morning excluded"},
+		{ts10_30, 0, 0, true, "no filter (0,0) matches all"},
+		{ts10_30, 10, 11, true, "exact hour"},
+		{ts10_30, 10, 10, false, "hour at boundary"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.description, func(t *testing.T) {
+			result, err := messageMatchesHourRange(tt.timestamp, tt.startHour, tt.endHour)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if result != tt.expected {
+				t.Errorf("expected %v for hour range %d-%d, got %v", tt.expected, tt.startHour, tt.endHour, result)
+			}
+		})
+	}
+}
