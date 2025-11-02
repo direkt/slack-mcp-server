@@ -925,18 +925,19 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 			if chName == "" {
 				continue
 			}
-			f, err := ch.paramFormatChannel(chName)
+			f, err := ch.paramFormatChannelForSearch(chName)
 			if err != nil {
-				ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
-				return nil, err
+				// Invalid format, skip this channel
+				ch.logger.Warn("Invalid channel format, skipping", zap.String("filter", chName), zap.Error(err))
+				continue
 			}
 			channels = append(channels, f)
 		}
 	} else if chName := req.GetString("filter_in_channel", ""); chName != "" {
-		f, err := ch.paramFormatChannel(chName)
+		f, err := ch.paramFormatChannelForSearch(chName)
 		if err != nil {
+			// Invalid format, return error
 			ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
-
 			return nil, err
 		}
 		addFilter(filters, "in", f)
@@ -1109,6 +1110,41 @@ func (ch *ConversationsHandler) paramFormatChannel(raw string) (string, error) {
 			return chn.Name, nil
 		}
 		return "", fmt.Errorf("channel %q not found", raw)
+	}
+	return "", fmt.Errorf("invalid channel format: %q", raw)
+}
+
+// paramFormatChannelForSearch attempts to resolve channel name from cache, but falls back
+// to using the name directly if cache isn't ready or channel not found (Slack search can handle names)
+func (ch *ConversationsHandler) paramFormatChannelForSearch(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	
+	// Check if cache is ready
+	ready, _ := ch.apiProvider.IsReady()
+	if !ready {
+		// Cache not ready, return the name as-is (Slack search can handle it)
+		if strings.HasPrefix(raw, "#") || strings.HasPrefix(raw, "C") || strings.HasPrefix(raw, "G") {
+			return raw, nil
+		}
+		return "", fmt.Errorf("cache not ready and invalid channel format: %q", raw)
+	}
+	
+	// Try to resolve from cache
+	cms := ch.apiProvider.ProvideChannelsMaps()
+	if strings.HasPrefix(raw, "#") {
+		if id, ok := cms.ChannelsInv[raw]; ok {
+			return cms.Channels[id].Name, nil
+		}
+		// Channel not in cache, but return name anyway for search
+		return raw, nil
+	}
+	// Handle both C (standard channels) and G (private groups/channels) prefixes
+	if strings.HasPrefix(raw, "C") || strings.HasPrefix(raw, "G") {
+		if chn, ok := cms.Channels[raw]; ok {
+			return chn.Name, nil
+		}
+		// Channel ID not in cache, but return it anyway for search
+		return raw, nil
 	}
 	return "", fmt.Errorf("invalid channel format: %q", raw)
 }
@@ -1387,4 +1423,684 @@ func buildQuery(freeText []string, filters map[string][]string) string {
 		}
 	}
 	return strings.Join(out, " ")
+}
+
+// ConversationsGetMessageContextHandler gets messages before and after a specific message
+func (ch *ConversationsHandler) ConversationsGetMessageContextHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsGetMessageContextHandler called", zap.Any("params", request.Params))
+
+	channelID := request.GetString("channel_id", "")
+	if channelID == "" {
+		return nil, errors.New("channel_id is required")
+	}
+
+	messageTs := request.GetString("message_ts", "")
+	if messageTs == "" {
+		return nil, errors.New("message_ts is required")
+	}
+
+	beforeCount := request.GetInt("before_count", 5)
+	afterCount := request.GetInt("after_count", 5)
+	includeThread := request.GetBool("include_thread", true)
+
+	// Parse timestamp to get numeric value
+	tsParts := strings.Split(messageTs, ".")
+	if len(tsParts) != 2 {
+		return nil, fmt.Errorf("invalid message_ts format: %s, expected format: 1234567890.123456", messageTs)
+	}
+
+	tsSeconds, err := strconv.ParseInt(tsParts[0], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid message_ts seconds: %v", err)
+	}
+
+	// Resolve channel name to ID if needed
+	if strings.HasPrefix(channelID, "#") || strings.HasPrefix(channelID, "@") {
+		if ready, err := ch.apiProvider.IsReady(); !ready {
+			if errors.Is(err, provider.ErrChannelsNotReady) {
+				return nil, fmt.Errorf("channels cache not ready: %v", err)
+			}
+		}
+		channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+		chn, ok := channelsMaps.ChannelsInv[channelID]
+		if !ok {
+			return nil, fmt.Errorf("channel %q not found", channelID)
+		}
+		channelID = channelsMaps.Channels[chn].ID
+	}
+
+	// Calculate time window around the message
+	// We'll fetch messages in a range that should include before_count + after_count messages
+	// Estimate 1 minute per message for safety
+	windowSeconds := int64((beforeCount + afterCount + 1) * 60)
+	if windowSeconds < 300 {
+		windowSeconds = 300 // Minimum 5 minutes
+	}
+
+	oldestTs := fmt.Sprintf("%d.000000", tsSeconds-windowSeconds)
+	latestTs := fmt.Sprintf("%d.999999", tsSeconds+windowSeconds)
+
+	historyParams := slack.GetConversationHistoryParameters{
+		ChannelID: channelID,
+		Oldest:    oldestTs,
+		Latest:    latestTs,
+		Limit:     beforeCount + afterCount + 1,
+		Inclusive: true,
+	}
+
+	history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+	if err != nil {
+		ch.logger.Error("GetConversationHistoryContext failed", zap.Error(err))
+		return nil, err
+	}
+
+	// Find the target message and extract messages before/after
+	// Messages come in reverse chronological order (newest first)
+	var beforeMessages, targetMessage, afterMessages []slack.Message
+	targetFound := false
+
+	for _, msg := range history.Messages {
+		if msg.Timestamp == messageTs {
+			targetMessage = []slack.Message{msg}
+			targetFound = true
+			continue
+		}
+
+		if !targetFound {
+			// Messages after target (newer messages come first in reverse chronological order)
+			if len(afterMessages) < afterCount {
+				afterMessages = append([]slack.Message{msg}, afterMessages...)
+			}
+		} else {
+			// Messages before target (older messages come after target in reverse chronological order)
+			if len(beforeMessages) < beforeCount {
+				beforeMessages = append(beforeMessages, msg)
+			}
+		}
+	}
+
+	// Reverse beforeMessages and afterMessages to get chronological order
+	for i, j := 0, len(beforeMessages)-1; i < j; i, j = i+1, j-1 {
+		beforeMessages[i], beforeMessages[j] = beforeMessages[j], beforeMessages[i]
+	}
+	for i, j := 0, len(afterMessages)-1; i < j; i, j = i+1, j-1 {
+		afterMessages[i], afterMessages[j] = afterMessages[j], afterMessages[i]
+	}
+
+	// Combine all messages
+	allMessages := append(append(beforeMessages, targetMessage...), afterMessages...)
+
+	if !targetFound && len(allMessages) == 0 {
+		return nil, fmt.Errorf("message with timestamp %s not found in channel %s", messageTs, channelID)
+	}
+
+	// Include thread replies if requested and message is in a thread
+	messages := ch.convertMessagesFromHistory(allMessages, channelID, false)
+
+	if includeThread && len(targetMessage) > 0 && targetMessage[0].ThreadTimestamp == "" {
+		// Check if this message has replies (it might be a thread parent)
+		replies, _, _, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx,
+			&slack.GetConversationRepliesParameters{
+				ChannelID: channelID,
+				Timestamp: messageTs,
+				Limit:     50,
+			})
+		if err == nil && len(replies) > 1 {
+			// Include thread replies
+			threadMessages := ch.convertMessagesFromHistory(replies[1:], channelID, false)
+			messages = append(messages, threadMessages...)
+		}
+	}
+
+	return marshalMessagesToCSV(messages)
+}
+
+// ConversationsFindRelatedThreadsHandler finds threads with similar keywords or error patterns
+func (ch *ConversationsHandler) ConversationsFindRelatedThreadsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsFindRelatedThreadsHandler called", zap.Any("params", request.Params))
+
+	searchQuery := request.GetString("search_query", "")
+	if searchQuery == "" {
+		return nil, errors.New("search_query is required")
+	}
+
+	channelID := request.GetString("channel_id", "")
+	filterDateAfter := request.GetString("filter_date_after", "")
+	minThreadReplies := request.GetInt("filter_min_thread_replies", 1)
+	limit := request.GetInt("limit", 10)
+
+	// Build search parameters
+	args := map[string]interface{}{
+		"search_query":             searchQuery,
+		"filter_threads_only":      true,
+		"filter_min_thread_replies": minThreadReplies,
+		"limit":                     limit * 2, // Get more to account for grouping
+	}
+
+	if channelID != "" {
+		args["filter_in_channel"] = channelID
+	}
+
+	if filterDateAfter != "" {
+		args["filter_date_after"] = filterDateAfter
+	}
+
+	// Build searchParams directly
+	params := &searchParams{
+		query:             searchQuery,
+		limit:             limit * 2,
+		page:              1,
+		minThreadReplies:  minThreadReplies,
+		postSearchFilters: minThreadReplies > 0,
+	}
+
+	if channelID != "" {
+		chName, err := ch.paramFormatChannel(channelID)
+		if err == nil {
+			params.channels = []string{chName}
+		}
+	}
+
+	// Build query with thread filter
+	freeText, filters := splitQuery(searchQuery)
+	addFilter(filters, "is", "thread")
+	if filterDateAfter != "" {
+		convertedDate, err := parseDateRangeFormat(filterDateAfter)
+		if err == nil {
+			dateMap, _ := buildDateFilters("", convertedDate, "", "")
+			for key, val := range dateMap {
+				addFilter(filters, key, val)
+			}
+		}
+	}
+	params.query = buildQuery(freeText, filters)
+
+	// Execute search using internal logic
+	return ch.executeSearch(ctx, params)
+}
+
+// executeSearch executes a search with the given parameters
+func (ch *ConversationsHandler) executeSearch(ctx context.Context, params *searchParams) (*mcp.CallToolResult, error) {
+	var allMessages []slack.SearchMessage
+
+	// Handle multi-channel search
+	if len(params.channels) > 0 {
+		for _, channelName := range params.channels {
+			baseQuery := sanitizeRemoveInFilters(params.query)
+			queryWithChannel := strings.TrimSpace(baseQuery + " in:" + channelName)
+
+			searchParams := slack.SearchParameters{
+				Sort:          slack.DEFAULT_SEARCH_SORT,
+				SortDirection: slack.DEFAULT_SEARCH_SORT_DIR,
+				Highlight:     false,
+				Count:         params.limit,
+				Page:          params.page,
+			}
+
+			messagesRes, _, err := ch.apiProvider.Slack().SearchContext(ctx, queryWithChannel, searchParams)
+			if err != nil {
+				ch.logger.Error("Slack SearchContext failed for channel", zap.String("channel", channelName), zap.Error(err))
+				return nil, err
+			}
+
+			allMessages = append(allMessages, messagesRes.Matches...)
+		}
+
+		sort.Slice(allMessages, func(i, j int) bool {
+			return allMessages[i].Timestamp > allMessages[j].Timestamp
+		})
+	} else {
+		searchParams := slack.SearchParameters{
+			Sort:          slack.DEFAULT_SEARCH_SORT,
+			SortDirection: slack.DEFAULT_SEARCH_SORT_DIR,
+			Highlight:     false,
+			Count:         params.limit,
+			Page:          params.page,
+		}
+
+		messagesRes, _, err := ch.apiProvider.Slack().SearchContext(ctx, params.query, searchParams)
+		if err != nil {
+			ch.logger.Error("Slack SearchContext failed", zap.Error(err))
+			return nil, err
+		}
+
+		allMessages = messagesRes.Matches
+	}
+
+	// Apply post-search filters
+	if params.postSearchFilters {
+		var err error
+		allMessages, err = ch.applyPostSearchFilters(ctx, allMessages, params)
+		if err != nil {
+			ch.logger.Error("Failed to apply post-search filters", zap.Error(err))
+			return nil, err
+		}
+	}
+
+	// Enforce global limit for multi-channel search after filtering
+	if len(params.channels) > 0 {
+		if params.limit > 0 && len(allMessages) > params.limit {
+			allMessages = allMessages[:params.limit]
+		}
+	}
+
+	messages := ch.convertMessagesFromSearch(allMessages)
+	return marshalMessagesToCSV(messages)
+}
+
+// ConversationsGetUserTimelineHandler gets all messages from a specific user in a time range
+func (ch *ConversationsHandler) ConversationsGetUserTimelineHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsGetUserTimelineHandler called", zap.Any("params", request.Params))
+
+	userID := request.GetString("user_id", "")
+	if userID == "" {
+		return nil, errors.New("user_id is required")
+	}
+
+	filterDateAfter := request.GetString("filter_date_after", "")
+	if filterDateAfter == "" {
+		return nil, errors.New("filter_date_after is required")
+	}
+
+	filterDateBefore := request.GetString("filter_date_before", "")
+	filterInChannels := request.GetString("filter_in_channels", "")
+	limit := request.GetInt("limit", 50)
+
+	// Format user ID for search - paramFormatUser returns <@U123> format, we need just the user ID
+	var userIDForSearch string
+	if strings.HasPrefix(userID, "U") {
+		userIDForSearch = userID
+	} else {
+		userFormatted, err := ch.paramFormatUser(userID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid user_id: %v", err)
+		}
+		// Extract user ID from <@U123> format
+		userIDForSearch = strings.TrimPrefix(strings.TrimSuffix(userFormatted, ">"), "<@")
+	}
+
+	// Build search parameters
+	freeText, filters := splitQuery("")
+	userFormatted, err := ch.paramFormatUser(userIDForSearch)
+	if err == nil {
+		addFilter(filters, "from", userFormatted)
+	}
+
+	// Handle date filters
+	convertedDateAfter, err := parseDateRangeFormat(filterDateAfter)
+	if err == nil && convertedDateAfter != "" {
+		dateMap, _ := buildDateFilters(filterDateBefore, convertedDateAfter, "", "")
+		for key, val := range dateMap {
+			addFilter(filters, key, val)
+		}
+	}
+
+	query := buildQuery(freeText, filters)
+	params := &searchParams{
+		query:    query,
+		limit:    limit,
+		page:     1,
+		channels: []string{},
+	}
+
+	// Handle channel filter
+	if filterInChannels != "" {
+		chNames := strings.Split(filterInChannels, ",")
+		for _, chName := range chNames {
+			chName = strings.TrimSpace(chName)
+			if chName == "" {
+				continue
+			}
+			chFormatted, err := ch.paramFormatChannel(chName)
+			if err == nil {
+				params.channels = append(params.channels, chFormatted)
+			}
+		}
+	}
+
+	return ch.executeSearch(ctx, params)
+}
+
+// ThreadAnalysis represents analysis of a thread
+type ThreadAnalysis struct {
+	ThreadTs            string            `json:"threadTs" csv:"threadTs"`
+	Channel             string            `json:"channel" csv:"channel"`
+	ParticipantCount    int               `json:"participantCount" csv:"participantCount"`
+	MessageCount        int               `json:"messageCount" csv:"messageCount"`
+	Participants        string            `json:"participants" csv:"participants"` // CSV of user:count
+	Reactions           string            `json:"reactions" csv:"reactions"`       // CSV of reaction:count
+	HasResolution       bool              `json:"hasResolution" csv:"hasResolution"`
+	ResolutionIndicators string           `json:"resolutionIndicators" csv:"resolutionIndicators"`
+	FirstMessageTime    string            `json:"firstMessageTime" csv:"firstMessageTime"`
+	LastMessageTime     string            `json:"lastMessageTime" csv:"lastMessageTime"`
+	DurationHours       float64           `json:"durationHours" csv:"durationHours"`
+}
+
+// ConversationsAnalyzeThreadHandler provides comprehensive thread analysis
+func (ch *ConversationsHandler) ConversationsAnalyzeThreadHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsAnalyzeThreadHandler called", zap.Any("params", request.Params))
+
+	channelID := request.GetString("channel_id", "")
+	if channelID == "" {
+		return nil, errors.New("channel_id is required")
+	}
+
+	threadTs := request.GetString("thread_ts", "")
+	if threadTs == "" {
+		return nil, errors.New("thread_ts is required")
+	}
+
+	includeResolutionIndicators := request.GetBool("include_resolution_indicators", true)
+
+	// Resolve channel name to ID if needed
+	if strings.HasPrefix(channelID, "#") || strings.HasPrefix(channelID, "@") {
+		if ready, err := ch.apiProvider.IsReady(); !ready {
+			if errors.Is(err, provider.ErrChannelsNotReady) {
+				return nil, fmt.Errorf("channels cache not ready: %v", err)
+			}
+		}
+		channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+		chn, ok := channelsMaps.ChannelsInv[channelID]
+		if !ok {
+			return nil, fmt.Errorf("channel %q not found", channelID)
+		}
+		channelID = channelsMaps.Channels[chn].ID
+	}
+
+	// Get all thread replies
+	repliesParams := slack.GetConversationRepliesParameters{
+		ChannelID: channelID,
+		Timestamp: threadTs,
+		Limit:     1000, // Get all replies
+	}
+
+	replies, _, _, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &repliesParams)
+	if err != nil {
+		ch.logger.Error("GetConversationRepliesContext failed", zap.Error(err))
+		return nil, err
+	}
+
+	if len(replies) == 0 {
+		return nil, fmt.Errorf("thread %s not found in channel %s", threadTs, channelID)
+	}
+
+	// Analyze thread
+	analysis := ch.analyzeThreadParticipants(replies, includeResolutionIndicators)
+
+	// Set channel name
+	channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+	if chn, ok := channelsMaps.Channels[channelID]; ok {
+		analysis.Channel = "#" + chn.Name
+	} else {
+		analysis.Channel = channelID
+	}
+	analysis.ThreadTs = threadTs
+
+	// Marshal to CSV
+	csvBytes, err := gocsv.MarshalBytes([]ThreadAnalysis{analysis})
+	if err != nil {
+		return nil, err
+	}
+
+	return mcp.NewToolResultText(string(csvBytes)), nil
+}
+
+// ConversationsSearchByReactionHandler finds messages with specific reactions
+func (ch *ConversationsHandler) ConversationsSearchByReactionHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsSearchByReactionHandler called", zap.Any("params", request.Params))
+
+	reactionName := request.GetString("reaction_name", "")
+	if reactionName == "" {
+		return nil, errors.New("reaction_name is required")
+	}
+
+	channelID := request.GetString("channel_id", "")
+	filterDateAfter := request.GetString("filter_date_after", "")
+	limit := request.GetInt("limit", 20)
+
+	// Resolve channel name to ID if needed
+	if channelID != "" {
+		if strings.HasPrefix(channelID, "#") || strings.HasPrefix(channelID, "@") {
+			if ready, err := ch.apiProvider.IsReady(); !ready {
+				if errors.Is(err, provider.ErrChannelsNotReady) {
+					return nil, fmt.Errorf("channels cache not ready: %v", err)
+				}
+			}
+			channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+			chn, ok := channelsMaps.ChannelsInv[channelID]
+			if !ok {
+				return nil, fmt.Errorf("channel %q not found", channelID)
+			}
+			channelID = channelsMaps.Channels[chn].ID
+		}
+	}
+
+	// Calculate time range
+	var oldestTs string
+	if filterDateAfter != "" {
+		_, normalized, err := parseFlexibleDate(filterDateAfter)
+		if err != nil {
+			return nil, fmt.Errorf("invalid filter_date_after: %v", err)
+		}
+		t, _, _ := parseFlexibleDate(normalized)
+		oldestTs = fmt.Sprintf("%d.000000", t.Unix())
+	} else {
+		// Default to last 30 days
+		oldestTs = fmt.Sprintf("%d.000000", time.Now().AddDate(0, 0, -30).Unix())
+	}
+
+	// Fetch messages from channel(s)
+	var allMessages []slack.Message
+	if channelID != "" {
+		historyParams := slack.GetConversationHistoryParameters{
+			ChannelID: channelID,
+			Oldest:    oldestTs,
+			Limit:     limit * 5, // Fetch more to account for filtering
+		}
+		history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+		if err != nil {
+			return nil, err
+		}
+		allMessages = history.Messages
+	} else {
+		// Note: Searching by reaction across all channels would require fetching all messages
+		// and filtering, which is expensive. For now, we'll only support single channel search
+		return nil, errors.New("searching by reaction across all channels requires channel_id")
+	}
+
+	// Filter messages by reaction
+	filteredMessages := ch.filterMessagesByReaction(allMessages, reactionName, limit)
+
+	messages := ch.convertMessagesFromHistory(filteredMessages, channelID, false)
+	return marshalMessagesToCSV(messages)
+}
+
+// ConversationsFindPatternsHandler searches for similar messages/patterns
+func (ch *ConversationsHandler) ConversationsFindPatternsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsFindPatternsHandler called", zap.Any("params", request.Params))
+
+	pattern := request.GetString("pattern", "")
+	if pattern == "" {
+		return nil, errors.New("pattern is required")
+	}
+
+	filterInChannels := request.GetString("filter_in_channels", "")
+	filterDateAfter := request.GetString("filter_date_after", "")
+	exactMatch := request.GetBool("exact_match", false)
+	limit := request.GetInt("limit", 50)
+
+	// Build search parameters
+	freeText, filters := splitQuery(pattern)
+
+	// Handle date filter
+	if filterDateAfter != "" {
+		convertedDate, err := parseDateRangeFormat(filterDateAfter)
+		if err == nil && convertedDate != "" {
+			dateMap, _ := buildDateFilters("", convertedDate, "", "")
+			for key, val := range dateMap {
+				addFilter(filters, key, val)
+			}
+		}
+	}
+
+	query := buildQuery(freeText, filters)
+	params := &searchParams{
+		query:    query,
+		limit:    limit * 2, // Get more to account for filtering
+		page:     1,
+		channels: []string{},
+	}
+
+	// Handle channel filter
+	if filterInChannels != "" {
+		chNames := strings.Split(filterInChannels, ",")
+		for _, chName := range chNames {
+			chName = strings.TrimSpace(chName)
+			if chName == "" {
+				continue
+			}
+			chFormatted, err := ch.paramFormatChannel(chName)
+			if err == nil {
+				params.channels = append(params.channels, chFormatted)
+			}
+		}
+	}
+
+	// Execute search
+	result, err := ch.executeSearch(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+
+	// If exact_match is true, we'd need to parse CSV and filter exact matches
+	// For now, return search results (Slack search does partial matching)
+	if exactMatch {
+		ch.logger.Warn("exact_match filtering not yet implemented, returning search results")
+	}
+
+	return result, nil
+}
+
+// Helper functions
+
+func (ch *ConversationsHandler) analyzeThreadParticipants(replies []slack.Message, includeResolutionIndicators bool) ThreadAnalysis {
+	usersMap := ch.apiProvider.ProvideUsersMap()
+	participantMap := make(map[string]int)
+	reactionMap := make(map[string]int)
+	var resolutionIndicators []string
+
+	var firstTime, lastTime time.Time
+	firstTS := ""
+	lastTS := ""
+
+	resolutionKeywords := []string{"resolved", "fixed", "solved", "done", "completed", "closed"}
+	resolutionReactions := []string{"white_check_mark", "check", "heavy_check_mark"}
+
+	for i, msg := range replies {
+		// Track participants
+		if msg.User != "" {
+			participantMap[msg.User]++
+		}
+
+		// Track reactions
+		for _, reaction := range msg.Reactions {
+			reactionMap[reaction.Name] += reaction.Count
+			if includeResolutionIndicators {
+				for _, resReaction := range resolutionReactions {
+					if reaction.Name == resReaction {
+						resolutionIndicators = append(resolutionIndicators, fmt.Sprintf("reaction:%s", reaction.Name))
+					}
+				}
+			}
+		}
+
+		// Check for resolution keywords
+		if includeResolutionIndicators {
+			msgText := strings.ToLower(msg.Text)
+			for _, keyword := range resolutionKeywords {
+				if strings.Contains(msgText, keyword) {
+					resolutionIndicators = append(resolutionIndicators, fmt.Sprintf("keyword:%s", keyword))
+				}
+			}
+		}
+
+		// Track timestamps
+		tsParts := strings.Split(msg.Timestamp, ".")
+		if len(tsParts) == 2 {
+			tsSeconds, _ := strconv.ParseInt(tsParts[0], 10, 64)
+			msgTime := time.Unix(tsSeconds, 0)
+			if i == 0 || msgTime.Before(firstTime) {
+				firstTime = msgTime
+				firstTS = msg.Timestamp
+			}
+			if i == 0 || msgTime.After(lastTime) {
+				lastTime = msgTime
+				lastTS = msg.Timestamp
+			}
+		}
+	}
+
+	// Build participant string
+	var participantParts []string
+	for userID, count := range participantMap {
+		userName, realName, _ := getUserInfo(userID, usersMap.Users)
+		displayName := realName
+		if displayName == "" {
+			displayName = userName
+		}
+		if displayName == "" {
+			displayName = userID
+		}
+		participantParts = append(participantParts, fmt.Sprintf("%s:%d", displayName, count))
+	}
+
+	// Build reaction string
+	var reactionParts []string
+	for reactionName, count := range reactionMap {
+		reactionParts = append(reactionParts, fmt.Sprintf("%s:%d", reactionName, count))
+	}
+
+	// Calculate duration
+	durationHours := 0.0
+	if !firstTime.IsZero() && !lastTime.IsZero() {
+		durationHours = lastTime.Sub(firstTime).Hours()
+	}
+
+	// Format timestamps
+	firstTimeStr := ""
+	lastTimeStr := ""
+	if firstTS != "" {
+		firstTimeStr, _ = text.TimestampToIsoRFC3339(firstTS)
+	}
+	if lastTS != "" {
+		lastTimeStr, _ = text.TimestampToIsoRFC3339(lastTS)
+	}
+
+	return ThreadAnalysis{
+		ParticipantCount:     len(participantMap),
+		MessageCount:         len(replies),
+		Participants:         strings.Join(participantParts, "|"),
+		Reactions:            strings.Join(reactionParts, "|"),
+		HasResolution:        len(resolutionIndicators) > 0,
+		ResolutionIndicators: strings.Join(resolutionIndicators, ","),
+		FirstMessageTime:     firstTimeStr,
+		LastMessageTime:      lastTimeStr,
+		DurationHours:        durationHours,
+	}
+}
+
+func (ch *ConversationsHandler) filterMessagesByReaction(messages []slack.Message, reactionName string, limit int) []slack.Message {
+	var filtered []slack.Message
+	for _, msg := range messages {
+		for _, reaction := range msg.Reactions {
+			if reaction.Name == reactionName {
+				filtered = append(filtered, msg)
+				break
+			}
+		}
+		if len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
 }

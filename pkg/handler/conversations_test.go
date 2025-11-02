@@ -760,7 +760,7 @@ func TestUnitMessageMatchesHourRange(t *testing.T) {
 }
 
 func TestUnitSanitizeRemoveInFilters(t *testing.T) {
-	cases := []struct{
+	cases := []struct {
 		in  string
 		out string
 	}{
@@ -777,4 +777,3 @@ func TestUnitSanitizeRemoveInFilters(t *testing.T) {
 		}
 	}
 }
-
