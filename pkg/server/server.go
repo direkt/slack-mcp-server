@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/handler"
@@ -75,23 +76,26 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 		),
 	), conversationsHandler.ConversationsRepliesHandler)
 
-	s.AddTool(mcp.NewTool("conversations_add_message",
-		mcp.WithDescription("Add a message to a public channel, private channel, or direct message (DM, or IM) conversation by channel_id and thread_ts."),
-		mcp.WithString("channel_id",
-			mcp.Required(),
-			mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
-		),
-		mcp.WithString("thread_ts",
-			mcp.Description("Unique identifier of either a thread's parent message or a message in the thread_ts must be the timestamp in format 1234567890.123456 of an existing message with 0 or more replies. Optional, if not provided the message will be added to the channel itself, otherwise it will be added to the thread."),
-		),
-		mcp.WithString("payload",
-			mcp.Description("Message payload in specified content_type format. Example: 'Hello, world!' for text/plain or '# Hello, world!' for text/markdown."),
-		),
-		mcp.WithString("content_type",
-			mcp.DefaultString("text/markdown"),
-			mcp.Description("Content type of the message. Default is 'text/markdown'. Allowed values: 'text/markdown', 'text/plain'."),
-		),
-	), conversationsHandler.ConversationsAddMessageHandler)
+	// Register add_message tool only when explicitly enabled for safety
+	if cfg := os.Getenv("SLACK_MCP_ADD_MESSAGE_TOOL"); cfg != "" && cfg != "false" && cfg != "0" {
+		s.AddTool(mcp.NewTool("conversations_add_message",
+			mcp.WithDescription("Add a message to a public channel, private channel, or direct message (DM, or IM) conversation by channel_id and thread_ts."),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
+			),
+			mcp.WithString("thread_ts",
+				mcp.Description("Unique identifier of either a thread's parent message or a message in the thread_ts must be the timestamp in format 1234567890.123456 of an existing message with 0 or more replies. Optional, if not provided the message will be added to the channel itself, otherwise it will be added to the thread."),
+			),
+			mcp.WithString("payload",
+				mcp.Description("Message payload in specified content_type format. Example: 'Hello, world!' for text/plain or '# Hello, world!' for text/markdown."),
+			),
+			mcp.WithString("content_type",
+				mcp.DefaultString("text/markdown"),
+				mcp.Description("Content type of the message. Default is 'text/markdown'. Allowed values: 'text/markdown', 'text/plain'."),
+			),
+		), conversationsHandler.ConversationsAddMessageHandler)
+	}
 
 	s.AddTool(mcp.NewTool("conversations_search_messages",
 		mcp.WithDescription("Search messages in a public channel, private channel, or direct message (DM, or IM) conversation using filters. All filters are optional, if not provided then search_query is required."),

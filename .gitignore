@@ -6,6 +6,7 @@
 /extension.dxt/server/slack-mcp-server-*
 /extension.dxt/server/index.js
 /build/slack-mcp-server-*
+/build/slack-mcp-server
 /build/slack-mcp-server.dxt
 /npm/slack-mcp-server-*/bin/slack-mcp-server-*
 /npm/slack-mcp-server-*/.npmrc

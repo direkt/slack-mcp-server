@@ -39,6 +39,14 @@ var validFilterKeys = map[string]struct{}{
 	"during": {},
 }
 
+// sanitizeRemoveInFilters removes any existing in:<token> filters from a Slack search query
+func sanitizeRemoveInFilters(q string) string {
+	re := regexp.MustCompile(`\bin:[^\s]+`)
+	s := re.ReplaceAllString(q, "")
+	// Normalize whitespace
+	return strings.Join(strings.Fields(s), " ")
+}
+
 type Message struct {
 	MsgID     string `json:"msgID"`
 	UserID    string `json:"userID"`
@@ -331,15 +339,9 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 	// Handle multi-channel search
 	if len(params.channels) > 0 {
 		for _, channelName := range params.channels {
-			// Create query with specific channel filter
-			queryWithChannel := params.query
-			if strings.Contains(queryWithChannel, " in:") {
-				// Replace existing in: filter
-				queryWithChannel = strings.ReplaceAll(queryWithChannel, " in:"+strings.Split(queryWithChannel[strings.Index(queryWithChannel, " in:")+4:], " ")[0], " in:"+channelName)
-			} else {
-				// Add new in: filter
-				queryWithChannel = queryWithChannel + " in:" + channelName
-			}
+			// Create query with specific channel filter (remove any existing in:... first)
+			baseQuery := sanitizeRemoveInFilters(params.query)
+			queryWithChannel := strings.TrimSpace(baseQuery + " in:" + channelName)
 
 			searchParams := slack.SearchParameters{
 				Sort:          slack.DEFAULT_SEARCH_SORT,
@@ -392,20 +394,34 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 		}
 	}
 
-	messages := ch.convertMessagesFromSearch(allMessages)
-	if len(messages) > 0 {
-		// For multi-channel search, add cursor to last message for pagination
-		if len(params.channels) > 0 {
+	// Enforce global limit for multi-channel search after filtering, and set a simple cursor if more may exist
+	if len(params.channels) > 0 {
+		hadMore := false
+		if params.limit > 0 && len(allMessages) > params.limit {
+			allMessages = allMessages[:params.limit]
+			hadMore = true
+		}
+		messages := ch.convertMessagesFromSearch(allMessages)
+		if hadMore && len(messages) > 0 {
 			nextCursor := fmt.Sprintf("page:%d", params.page+1)
 			messages[len(messages)-1].Cursor = base64.StdEncoding.EncodeToString([]byte(nextCursor))
 		}
+		return marshalMessagesToCSV(messages)
 	}
+	messages := ch.convertMessagesFromSearch(allMessages)
 	return marshalMessagesToCSV(messages)
 }
 
 // applyPostSearchFilters filters messages based on day of week, hour range, and thread reply count
 func (ch *ConversationsHandler) applyPostSearchFilters(ctx context.Context, messages []slack.SearchMessage, params *searchParams) ([]slack.SearchMessage, error) {
 	var filtered []slack.SearchMessage
+
+	// Guardrail: cap the number of expensive thread lookups to avoid rate limits
+	maxLookups := params.limit
+	if maxLookups <= 0 || maxLookups > 200 {
+		maxLookups = 200
+	}
+	lookups := 0
 
 	for _, msg := range messages {
 		// Check day of week filter
@@ -434,14 +450,20 @@ func (ch *ConversationsHandler) applyPostSearchFilters(ctx context.Context, mess
 
 		// Check thread reply count filter
 		if params.minThreadReplies > 0 {
-			// Get thread info
+			if lookups >= maxLookups {
+				ch.logger.Warn("Reached max thread metadata lookups; results may be truncated for minThreadReplies filter",
+					zap.Int("limit", maxLookups),
+				)
+				break
+			}
+
 			channelID := msg.Channel.ID
 			replyCount, err := ch.getThreadReplyCount(ctx, channelID, msg.Timestamp)
+			lookups++
 			if err != nil {
 				ch.logger.Warn("Failed to get thread reply count", zap.String("channel", channelID), zap.String("ts", msg.Timestamp), zap.Error(err))
 				continue
 			}
-
 			if replyCount < params.minThreadReplies {
 				continue
 			}
@@ -468,8 +490,11 @@ func (ch *ConversationsHandler) getThreadReplyCount(ctx context.Context, channel
 	}
 
 	if len(replies) > 0 {
-		// The reply_count is in the message metadata
-		return len(replies) - 1, nil // -1 because first message is the parent
+		// Prefer the reply count provided by Slack on the parent message, if available
+		if replies[0].ReplyCount > 0 {
+			return replies[0].ReplyCount, nil
+		}
+		// Fallback: with Limit=1, only the parent is returned, so we cannot infer replies reliably
 	}
 
 	return 0, nil
@@ -911,6 +936,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		f, err := ch.paramFormatChannel(chName)
 		if err != nil {
 			ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
+
 			return nil, err
 		}
 		addFilter(filters, "in", f)
@@ -1049,6 +1075,7 @@ func (ch *ConversationsHandler) paramFormatUser(raw string) (string, error) {
 	if strings.HasPrefix(raw, "U") {
 		u, ok := users.Users[raw]
 		if !ok {
+
 			return "", fmt.Errorf("user %q not found", raw)
 		}
 		return fmt.Sprintf("<@%s>", u.ID), nil
@@ -1073,6 +1100,7 @@ func (ch *ConversationsHandler) paramFormatChannel(raw string) (string, error) {
 		if id, ok := cms.ChannelsInv[raw]; ok {
 			return cms.Channels[id].Name, nil
 		}
+
 		return "", fmt.Errorf("channel %q not found", raw)
 	}
 	// Handle both C (standard channels) and G (private groups/channels) prefixes

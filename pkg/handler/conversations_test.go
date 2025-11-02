@@ -758,3 +758,23 @@ func TestUnitMessageMatchesHourRange(t *testing.T) {
 		})
 	}
 }
+
+func TestUnitSanitizeRemoveInFilters(t *testing.T) {
+	cases := []struct{
+		in  string
+		out string
+	}{
+		{"foo bar", "foo bar"},
+		{"foo in:#general bar", "foo bar"},
+		{"in:C123", ""},
+		{"foo in:my-channel in:C123 baz", "foo baz"},
+		{"  foo   in:#general   bar  ", "foo bar"},
+	}
+	for _, c := range cases {
+		got := sanitizeRemoveInFilters(c.in)
+		if got != c.out {
+			t.Errorf("sanitizeRemoveInFilters(%q) = %q; want %q", c.in, got, c.out)
+		}
+	}
+}
+
